@@ -1,0 +1,12 @@
+config.yaml
+browser_data/
+browser_data_linkedin/
+digest.log
+venv/
+__pycache__/
+*.pyc
+.env
+
+accounts.txt
+*.png
+*.plist

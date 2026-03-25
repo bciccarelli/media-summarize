@@ -1,0 +1,17 @@
+# Gemini API
+gemini:
+  api_key: "your-gemini-api-key"
+  model: "gemini-2.5-flash"
+
+# Gmail SMTP (requires app password — enable 2FA first)
+# Generate app password at: https://myaccount.google.com/apppasswords
+email:
+  sender: "you@gmail.com"
+  app_password: "xxxx xxxx xxxx xxxx"
+  recipient: "you@gmail.com"
+
+# Settings
+settings:
+  target_tweets: 100          # How many tweets to collect from your X feed
+  target_linkedin_posts: 40   # Fewer than tweets — LinkedIn is stricter about bots
+  lookback_days: 7

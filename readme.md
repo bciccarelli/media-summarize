@@ -8,4 +8,4 @@ Summarizes your X and LinkedIn feed with local browser automation and sends you 
 
 ## Did I build this with claude
 
-Yes, thank you for asking. I used to write code but now my AI companion does almost all of it, so you get one oversized (in my opinion) python script. 
+Yes

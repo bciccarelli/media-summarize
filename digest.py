@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Weekly X/Twitter + LinkedIn digest: scroll feeds with browser, summarize with Gemini, email via Gmail."""
+"""Daily X + LinkedIn digest: scroll feeds, rank with Gemini, email top items, auto-like on X."""
 
 import asyncio
+import json
 import logging
+import os
 import random
 import smtplib
 import sys
@@ -23,6 +25,7 @@ BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 BROWSER_DIR = BASE_DIR / "browser_data"
 LINKEDIN_BROWSER_DIR = BASE_DIR / "browser_data_linkedin"
+STATE_PATH = BASE_DIR / "digest_state.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -382,206 +385,321 @@ async def fetch_linkedin_posts_browser(config: dict, login_mode: bool = False) -
 
 
 # ---------------------------------------------------------------------------
-# Summarization
+# State (cross-day dedup)
 # ---------------------------------------------------------------------------
 
-PROMPT_TEMPLATE = """\
-You are an analyst creating a weekly digest of X/Twitter posts for an AI engineer.
-Produce a concise, scannable summary in HTML format (no markdown — raw HTML only).
+def load_state(config: dict) -> dict:
+    """Load digest_state.json, purging entries older than dedup_window_days."""
+    if not STATE_PATH.exists():
+        return {"sent_items": []}
+    try:
+        with open(STATE_PATH) as f:
+            state = json.load(f)
+    except Exception as e:
+        log.warning(f"Failed to read state file: {e}; starting fresh")
+        return {"sent_items": []}
 
-STRUCTURE YOUR OUTPUT AS FOLLOWS (use <h2> tags for sections):
-
-<h2>Top Highlights</h2>
-The 3-5 most important developments this week. Each with a one-sentence summary,
-@handle attribution, and link to the original tweet.
-
-<h2>Research & Papers</h2>
-New research, papers, benchmarks, or scientific findings.
-
-<h2>Tools & Products</h2>
-New tools, product launches, feature announcements, open source releases.
-
-<h2>Industry & Business</h2>
-Funding, acquisitions, partnerships, hiring trends, policy/regulation.
-
-<h2>Opinions & Analysis</h2>
-Hot takes, threads with analysis, predictions, debates.
-
-<h2>Actionable Items</h2>
-Things the reader should DO: try a new tool, read a paper, apply to a job,
-sign up for a beta, attend an event. Be specific.
-
-RULES:
-- Each item: one sentence summary + @handle attribution + <a href> link
-- Skip low-value tweets (casual banter, memes, self-promotion without substance)
-- Content should be relevant to AI, machine-learning, data science, or broad but relevant technology trends. 
-- Group related tweets from different accounts on the same topic
-- If a tweet is a thread, summarize the full thread
-- Use HTML formatting: <h2>, <ul>, <li>, <a>, <strong>
-- Keep total output under 2000 words
-- If a section has no relevant items, omit it entirely
-- Do NOT wrap output in ```html code blocks — just output raw HTML
-
-TODAY'S DATE: {today}
-
-TWEET DATA:
-{tweet_data}
-"""
+    window = config.get("settings", {}).get("dedup_window_days", 7)
+    cutoff = (datetime.now() - timedelta(days=window)).strftime("%Y-%m-%d")
+    state["sent_items"] = [
+        item for item in state.get("sent_items", [])
+        if item.get("sent_on", "") >= cutoff
+    ]
+    return state
 
 
-def format_tweets_for_prompt(tweets: list[dict]) -> str:
-    parts = []
-    for t in tweets:
-        handle = t.get("handle", "unknown")
-        parts.append(
-            f"@{handle}: {t['text']} | {t.get('date', '')} | {t.get('url', '')} | "
-            f"{t.get('likes', 0)} likes | {t.get('retweets', 0)} RTs"
-        )
-    return "\n".join(parts)
+def save_state(state: dict):
+    """Atomically write the state file."""
+    tmp = STATE_PATH.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_PATH)
 
 
-def summarize(tweets: list[dict], config: dict) -> str:
-    """Send tweets to Gemini and return HTML summary."""
-    tweet_data = format_tweets_for_prompt(tweets)
-    if not tweet_data.strip():
-        return "<p>No tweets were collected this week.</p>"
-
-    gem = config["gemini"]
-    client = genai.Client(api_key=gem["api_key"])
-    model = gem.get("model", "gemini-2.5-flash")
-
-    prompt = PROMPT_TEMPLATE.format(tweet_data=tweet_data, today=datetime.now().strftime("%Y-%m-%d"))
-    log.info(f"Sending {len(tweet_data)} chars to Gemini ({model})")
-
-    response = client.models.generate_content(model=model, contents=prompt)
-    summary = response.text or "<p>Gemini returned no output.</p>"
-
-    log.info(f"Gemini returned {len(summary)} chars")
-    return summary
+def filter_by_sent_urls(tweets: list[dict], state: dict) -> list[dict]:
+    """Drop X tweets already surfaced in a recent digest. LinkedIn dedup is
+    handled via the RECENTLY COVERED prompt section instead (no stable URL)."""
+    sent_urls = {
+        item["url"] for item in state.get("sent_items", [])
+        if item.get("platform") == "x" and item.get("url")
+    }
+    filtered = [t for t in tweets if t.get("url") not in sent_urls]
+    dropped = len(tweets) - len(filtered)
+    if dropped:
+        log.info(f"Dedup dropped {dropped} X tweets seen in last window")
+    return filtered
 
 
-LINKEDIN_PROMPT_TEMPLATE = """\
-You are an analyst creating a weekly LinkedIn digest for a data scientist
-who works at startups. Focus on ACTIONABLE information from their professional
-network.
+# ---------------------------------------------------------------------------
+# Summarization (single Gemini call, JSON output)
+# ---------------------------------------------------------------------------
 
-Produce a concise, scannable summary in HTML format (no markdown — raw HTML only).
-
-STRUCTURE YOUR OUTPUT AS FOLLOWS (use <h2> tags for sections):
-
-<h2>Network Moves</h2>
-People changing jobs, getting promoted, starting companies.
-Note the person's name, their title, and the move.
-
-<h2>Opportunities</h2>
-Job postings, open roles, freelance gigs, collaborations, startup hiring,
-funding announcements (which imply hiring). Prioritize data science,
-ML, AI, and startup roles.
-
-<h2>Events & Learning</h2>
-Conferences, webinars, workshops, courses, meetups. Include dates if visible.
-
-<h2>Industry Signal</h2>
-Trends, opinions, analyses, and shared articles about data science, AI/ML,
-startups, or relevant tech. Focus on what's shifting in the market.
-
-<h2>Action Items</h2>
-Concrete things the reader should DO this week: congratulate someone,
-apply to a role, register for an event, read an article, reach out to
-a contact. Be specific with names and links.
-
-RULES:
-- Each item: one sentence summary + person's name and title + link if available
-- Skip low-value content (generic motivational posts, engagement bait,
-  polls without substance, reshares without commentary)
-- Author titles/roles provide important context — include them
-- Group related posts (e.g., multiple people discussing the same topic)
-- Use HTML formatting: <h2>, <ul>, <li>, <a>, <strong>
-- Keep total output under 1500 words
-- If a section has no relevant items, omit it entirely
-- Do NOT wrap output in ```html code blocks — just output raw HTML
-- Discard events, deadlines, or opportunities whose date has already passed
+DIGEST_PROMPT = """\
+You are curating a daily signal-only digest for an AI engineer / data scientist
+who works at startups. Their X + LinkedIn feeds are noisy — only surface items
+they should actually act on or know about today.
 
 TODAY'S DATE: {today}
 
-LINKEDIN POST DATA:
-{post_data}
+RULES:
+- Return AT MOST {max_items} items total across both platforms.
+- Only include items scoring {min_score}+ on a 1-10 signal scale. If nothing
+  meets the bar, return FEWER items — even zero is acceptable.
+- signal_score meaning: 10 = definitely act on this today; 7 = worth their 30
+  seconds; 5 = interesting but skippable; <5 = don't include.
+
+WHAT COUNTS AS SIGNAL:
+- Research / papers with concrete results (not "we should think about X")
+- Tool releases with a clear use-case they could try this week
+- Startup hiring DS/ML/AI roles (especially from their LinkedIn network)
+- Events / conferences with an RSVP window that hasn't expired
+- Funding announcements (implies hiring is about to open)
+- Close-connection job moves on LinkedIn (1st-degree moves to new roles)
+- Concrete industry shifts (regulation, named model release, acquisition)
+
+WHAT COUNTS AS JUNK (skip):
+- Motivational posts, "just shipped!" without a link, engagement-bait polls
+- Reshares without commentary
+- Generic AI-hype threads or unsubstantiated hot takes
+- Events whose date has already passed (check TODAY'S DATE)
+- Anything semantically covered in RECENTLY COVERED — even if the URL differs
+
+RECENTLY COVERED (do NOT re-surface these topics):
+{recently_covered}
+
+CATEGORIES (use exactly one per item):
+Research | Tools | Opportunity | Event | Network Move | Signal
+
+For each item, return:
+- platform: "x" or "linkedin"
+- url: the exact url from the input data (tweet URL for X, profile URL for LinkedIn)
+- author: @handle for X, "Name — Title" for LinkedIn
+- category: one of the six above
+- summary: ONE sentence, <=25 words, what they need to know / do
+- signal_score: integer 1-10
+- reason: short phrase (e.g. "concrete benchmark", "1st-degree move", "RSVP Friday")
+
+X POSTS:
+{x_data}
+
+LINKEDIN POSTS:
+{linkedin_data}
 """
 
 
-def format_linkedin_posts_for_prompt(posts: list[dict]) -> str:
-    parts = []
+DIGEST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string", "enum": ["x", "linkedin"]},
+                    "url": {"type": "string"},
+                    "author": {"type": "string"},
+                    "category": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "signal_score": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "platform", "url", "author", "category",
+                    "summary", "signal_score", "reason",
+                ],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+
+def format_x_for_prompt(tweets: list[dict]) -> str:
+    if not tweets:
+        return "(none)"
+    return "\n".join(
+        f"@{t.get('handle', 'unknown')}: {t['text']} | {t.get('url', '')} | "
+        f"{t.get('likes', 0)} likes | {t.get('retweets', 0)} RTs"
+        for t in tweets
+    )
+
+
+def format_linkedin_for_prompt(posts: list[dict]) -> str:
+    if not posts:
+        return "(none)"
+    lines = []
     for p in posts:
-        parts.append(
-            f"{p.get('name', 'Unknown')} ({p.get('title', '')}) "
-            f"[{p.get('postType', 'post')}]: {p['text']} | "
-            f"{p.get('url', '')} | "
-            f"{p.get('reactions', 0)} reactions | "
+        url = p.get("profileUrl") or ""
+        lines.append(
+            f"{p.get('name', 'Unknown')} — {p.get('title', '')}: {p['text']} | "
+            f"{url} | {p.get('reactions', 0)} reactions | "
             f"{p.get('comments', 0)} comments"
         )
-    return "\n".join(parts)
+    return "\n".join(lines)
 
 
-def summarize_linkedin(posts: list[dict], config: dict) -> str:
-    """Send LinkedIn posts to Gemini and return HTML summary."""
-    post_data = format_linkedin_posts_for_prompt(posts)
-    if not post_data.strip():
-        return "<p>No LinkedIn posts were collected this week.</p>"
+def format_recently_covered(state: dict) -> str:
+    items = state.get("sent_items", [])
+    if not items:
+        return "(nothing sent recently)"
+    items_sorted = sorted(items, key=lambda i: i.get("sent_on", ""), reverse=True)
+    return "\n".join(
+        f"[{i.get('sent_on', '?')}] {i.get('category', '?')}: {i.get('summary', '')}"
+        for i in items_sorted[:30]
+    )
+
+
+def summarize_combined(tweets: list[dict], posts: list[dict],
+                       state: dict, config: dict) -> list[dict]:
+    """Single Gemini call — returns a ranked list of digest items (JSON)."""
+    settings = config.get("settings", {})
+    max_items = settings.get("max_digest_items", 8)
+    min_score = settings.get("min_signal_score", 7)
+
+    prompt = DIGEST_PROMPT.format(
+        today=datetime.now().strftime("%A, %B %d, %Y"),
+        max_items=max_items,
+        min_score=min_score,
+        recently_covered=format_recently_covered(state),
+        x_data=format_x_for_prompt(tweets),
+        linkedin_data=format_linkedin_for_prompt(posts),
+    )
 
     gem = config["gemini"]
     client = genai.Client(api_key=gem["api_key"])
     model = gem.get("model", "gemini-2.5-flash")
 
-    prompt = LINKEDIN_PROMPT_TEMPLATE.format(post_data=post_data, today=datetime.now().strftime("%Y-%m-%d"))
-    log.info(f"Sending {len(post_data)} chars (LinkedIn) to Gemini ({model})")
+    log.info(f"Sending {len(prompt)} chars to Gemini ({model})")
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+            "response_schema": DIGEST_SCHEMA,
+        },
+    )
 
-    response = client.models.generate_content(model=model, contents=prompt)
-    summary = response.text or "<p>Gemini returned no output.</p>"
+    try:
+        data = json.loads(response.text or "{}")
+        items = data.get("items", [])
+    except json.JSONDecodeError as e:
+        log.error(f"Gemini returned invalid JSON: {e}")
+        return []
 
-    log.info(f"Gemini returned {len(summary)} chars (LinkedIn)")
-    return summary
+    items = [i for i in items if i.get("signal_score", 0) >= min_score]
+    items.sort(key=lambda i: i.get("signal_score", 0), reverse=True)
+    items = items[:max_items]
+
+    log.info(f"Gemini surfaced {len(items)} items meeting signal floor")
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Render digest → HTML
+# ---------------------------------------------------------------------------
+
+CATEGORY_ORDER = ["Research", "Tools", "Opportunity", "Event", "Network Move", "Signal"]
+
+
+def render_digest_html(items: list[dict]) -> str:
+    if not items:
+        return ('<p><em>Nothing met the signal bar today. '
+                'Quiet day — go touch grass.</em></p>')
+
+    by_cat: dict[str, list[dict]] = {}
+    for item in items:
+        by_cat.setdefault(item.get("category", "Signal"), []).append(item)
+
+    parts = []
+    seen_cats = set()
+    ordered_cats = [c for c in CATEGORY_ORDER if c in by_cat] + [
+        c for c in by_cat if c not in CATEGORY_ORDER
+    ]
+    for cat in ordered_cats:
+        if cat in seen_cats:
+            continue
+        seen_cats.add(cat)
+        parts.append(
+            f'<h2 style="font-size:16px;margin-top:24px;margin-bottom:8px;'
+            f'color:#555;">{cat}</h2>'
+        )
+        parts.append('<ul style="padding-left:20px;margin-top:0;">')
+        for item in by_cat[cat]:
+            url = item.get("url", "")
+            author = item.get("author", "")
+            summary = item.get("summary", "")
+            score = item.get("signal_score", 0)
+            reason = item.get("reason", "")
+            link_html = (
+                f'<a href="{url}" style="color:#1da1f2;">link</a>'
+                if url else ""
+            )
+            platform_badge = "X" if item.get("platform") == "x" else "LI"
+            parts.append(
+                f'<li style="margin-bottom:10px;">'
+                f'<strong>{summary}</strong><br>'
+                f'<span style="color:#888;font-size:13px;">'
+                f'{platform_badge} · {author} · {reason} · '
+                f'score {score}{" · " + link_html if link_html else ""}'
+                f'</span></li>'
+            )
+        parts.append("</ul>")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Auto-like top X posts
+# ---------------------------------------------------------------------------
+
+async def like_top_tweets(urls: list[str], config: dict):
+    """Open each tweet URL and click the like button with human-like pauses."""
+    if not urls:
+        return
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(BROWSER_DIR),
+            headless=True,
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+        )
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        for url in urls:
+            try:
+                log.info(f"Opening for like: {url}")
+                await page.goto(url, wait_until="domcontentloaded")
+
+                # Wait for an active (not-yet-liked) like button
+                try:
+                    await page.wait_for_selector(
+                        'button[data-testid="like"]', timeout=10000
+                    )
+                except Exception:
+                    log.info(f"  No like button (already liked or unavailable): {url}")
+                    continue
+
+                # Dwell as if reading
+                await asyncio.sleep(random.uniform(3.0, 7.0))
+
+                await page.click('button[data-testid="like"]')
+                log.info(f"  Liked: {url}")
+
+                # Dwell before next
+                await asyncio.sleep(random.uniform(4.0, 9.0))
+            except Exception as e:
+                log.warning(f"  Like failed for {url}: {e}")
+                continue
+
+        await context.close()
 
 
 # ---------------------------------------------------------------------------
 # Email
 # ---------------------------------------------------------------------------
 
-def build_email_html(x_summary: str, linkedin_summary: str,
-                     config: dict, x_stats: dict, linkedin_stats: dict) -> str:
+def build_email_html(summary_html: str, stats: dict) -> str:
     today = datetime.now()
-    week_ago = today - timedelta(days=config.get("settings", {}).get("lookback_days", 7))
-    date_range = f"{week_ago.strftime('%b %d')} – {today.strftime('%b %d, %Y')}"
-
-    # X section (only if tweets were collected)
-    x_section = ""
-    if x_stats["total_tweets"] > 0:
-        x_section = f"""
-  <div style="margin-bottom: 30px;">
-    <h1 style="border-bottom: 2px solid #1da1f2; padding-bottom: 10px;
-               font-size: 22px; margin-bottom: 5px;">
-      X / Twitter &mdash; {date_range}
-    </h1>
-    <p style="color: #888; font-size: 13px; margin-top: 0;">
-      {x_stats['total_tweets']} tweets from {x_stats['unique_handles']} accounts
-    </p>
-    {x_summary}
-  </div>"""
-
-    # LinkedIn section (only if posts were collected)
-    linkedin_section = ""
-    if linkedin_stats["total_posts"] > 0:
-        linkedin_section = f"""
-  <div style="margin-bottom: 30px;">
-    <h1 style="border-bottom: 2px solid #0077b5; padding-bottom: 10px;
-               font-size: 22px; margin-bottom: 5px;">
-      LinkedIn &mdash; {date_range}
-    </h1>
-    <p style="color: #888; font-size: 13px; margin-top: 0;">
-      {linkedin_stats['total_posts']} posts from {linkedin_stats['unique_authors']} people
-    </p>
-    {linkedin_summary}
-  </div>"""
-
     return f"""\
 <!DOCTYPE html>
 <html>
@@ -589,8 +707,16 @@ def build_email_html(x_summary: str, linkedin_summary: str,
 <body style="font-family: -apple-system, Segoe UI, Arial, sans-serif;
              max-width: 640px; margin: 0 auto; padding: 20px;
              color: #333; line-height: 1.6; font-size: 15px;">
-  {x_section}
-  {linkedin_section}
+  <h1 style="border-bottom: 2px solid #333; padding-bottom: 10px;
+             font-size: 22px; margin-bottom: 5px;">
+    Daily Digest &mdash; {today.strftime('%A, %b %d, %Y')}
+  </h1>
+  <p style="color: #888; font-size: 13px; margin-top: 0;">
+    {stats['item_count']} items surfaced from {stats['tweet_count']} tweets + {stats['post_count']} LinkedIn posts
+  </p>
+
+  {summary_html}
+
   <hr style="margin-top: 30px; border: none; border-top: 1px solid #eee;">
   <p style="color: #aaa; font-size: 11px;">
     Generated {today.strftime('%Y-%m-%d %H:%M')}
@@ -600,11 +726,9 @@ def build_email_html(x_summary: str, linkedin_summary: str,
 
 
 def send_email(html: str, config: dict):
-    """Send the digest email via Gmail SMTP."""
     email_cfg = config["email"]
     today = datetime.now()
-    week_ago = today - timedelta(days=config.get("settings", {}).get("lookback_days", 7))
-    subject = f"Weekly Digest: {week_ago.strftime('%b %d')} – {today.strftime('%b %d')}"
+    subject = f"Digest: {today.strftime('%a %b %d')}"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -631,11 +755,12 @@ async def main():
     login_linkedin = "--login-linkedin" in sys.argv
     x_only = "--x-only" in sys.argv
     linkedin_only = "--linkedin-only" in sys.argv
+    no_like = "--no-like" in sys.argv
+    dry_run = "--dry-run" in sys.argv
 
-    log.info("=== Weekly Digest ===")
+    log.info("=== Daily Digest ===")
     config = load_config()
 
-    # Handle login modes (one at a time, then exit)
     if login_x:
         await fetch_tweets_browser(config, login_mode=True)
         return
@@ -643,14 +768,15 @@ async def main():
         await fetch_linkedin_posts_browser(config, login_mode=True)
         return
 
-    # Fetch X (skip if --linkedin-only)
+    state = load_state(config)
+    log.info(f"State: {len(state.get('sent_items', []))} recent items in memory")
+
     tweets = []
     if not linkedin_only:
         tweets = await fetch_tweets_browser(config)
         log.info(f"Fetched {len(tweets)} tweets from "
                  f"{len(set(t.get('handle', '') for t in tweets))} accounts")
 
-    # Fetch LinkedIn (skip if --x-only; sequential — less detectable)
     linkedin_posts = []
     if not x_only:
         linkedin_posts = await fetch_linkedin_posts_browser(config)
@@ -660,20 +786,50 @@ async def main():
     if not tweets and not linkedin_posts:
         log.warning("No content collected from any source")
 
-    # Summarize
-    x_summary = summarize(tweets, config) if tweets else ""
-    li_summary = summarize_linkedin(linkedin_posts, config) if linkedin_posts else ""
+    # Pre-Gemini URL filter (X only; LinkedIn dedup happens in-prompt)
+    tweets = filter_by_sent_urls(tweets, state)
 
-    # Combined email
-    x_total = len(tweets)
-    x_handles = len(set(t.get("handle", "") for t in tweets))
-    li_total = len(linkedin_posts)
-    li_authors = len(set(p.get("name", "") for p in linkedin_posts))
+    # Single Gemini call → ranked items
+    items = summarize_combined(tweets, linkedin_posts, state, config)
 
-    x_stats = {"total_tweets": x_total, "unique_handles": x_handles}
-    li_stats = {"total_posts": li_total, "unique_authors": li_authors}
-    full_html = build_email_html(x_summary, li_summary, config, x_stats, li_stats)
+    # Render + build email
+    summary_html = render_digest_html(items)
+    stats = {
+        "item_count": len(items),
+        "tweet_count": len(tweets),
+        "post_count": len(linkedin_posts),
+    }
+    full_html = build_email_html(summary_html, stats)
+
+    if dry_run:
+        log.info("--dry-run: printing HTML instead of sending / liking / saving state")
+        print(full_html)
+        return
+
     send_email(full_html, config)
+
+    # Persist today's items to state
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    for item in items:
+        state["sent_items"].append({
+            "url": item.get("url", ""),
+            "platform": item.get("platform"),
+            "summary": item.get("summary"),
+            "category": item.get("category"),
+            "sent_on": today_str,
+        })
+    save_state(state)
+    log.info(f"Saved {len(items)} new items to state")
+
+    # Auto-like top X tweets
+    if not no_like:
+        like_count = config.get("settings", {}).get("auto_like_count", 3)
+        x_urls = [i["url"] for i in items if i.get("platform") == "x"][:like_count]
+        if x_urls:
+            log.info(f"Liking top {len(x_urls)} X tweets")
+            await like_top_tweets(x_urls, config)
+        else:
+            log.info("No X items to like")
 
     log.info("Done!")
 

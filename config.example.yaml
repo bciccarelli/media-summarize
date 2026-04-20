@@ -12,6 +12,9 @@ email:
 
 # Settings
 settings:
-  target_tweets: 100          # How many tweets to collect from your X feed
-  target_linkedin_posts: 40   # Fewer than tweets — LinkedIn is stricter about bots
-  lookback_days: 7
+  target_tweets: 60           # How many tweets to collect from your X feed
+  target_linkedin_posts: 25   # Fewer than tweets — LinkedIn is stricter about bots
+  max_digest_items: 8         # Hard cap on items in the final email
+  min_signal_score: 7         # Items below this 1-10 score are filtered out
+  auto_like_count: 3          # Top-N X items to like each day
+  dedup_window_days: 7        # How long sent URLs stay in digest_state.json

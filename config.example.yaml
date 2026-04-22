@@ -16,5 +16,5 @@ settings:
   target_linkedin_posts: 25   # Fewer than tweets — LinkedIn is stricter about bots
   max_digest_items: 8         # Hard cap on items in the final email
   min_signal_score: 7         # Items below this 1-10 score are filtered out
-  auto_like_count: 3          # Top-N X items to like each day
+  suggest_like_count: 3       # Top-N X items to suggest liking manually
   dedup_window_days: 7        # How long sent URLs stay in digest_state.json

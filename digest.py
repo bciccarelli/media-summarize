@@ -648,57 +648,42 @@ def render_digest_html(items: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Auto-like top X posts
+# Suggested likes (top X items to manually engage with)
 # ---------------------------------------------------------------------------
 
-async def like_top_tweets(urls: list[str], config: dict):
-    """Open each tweet URL and click the like button with human-like pauses."""
-    if not urls:
-        return
+def render_suggested_likes_html(items: list[dict], count: int) -> str:
+    """Pick the top N X items by signal score and render a quick-action section."""
+    x_items = [i for i in items if i.get("platform") == "x" and i.get("url")]
+    x_items.sort(key=lambda i: i.get("signal_score", 0), reverse=True)
+    picks = x_items[:count]
+    if not picks:
+        return ""
 
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_DIR),
-            headless=True,
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
+    lines = [
+        '<h2 style="font-size:16px;margin-top:32px;margin-bottom:8px;color:#555;">'
+        'Worth a like (manual)</h2>',
+        '<p style="color:#888;font-size:13px;margin-top:0;">'
+        'Click through and like these to refine your X feed.</p>',
+        '<ol style="padding-left:20px;margin-top:8px;">',
+    ]
+    for item in picks:
+        url = item.get("url", "")
+        author = item.get("author", "")
+        summary = item.get("summary", "")
+        lines.append(
+            f'<li style="margin-bottom:8px;">'
+            f'<a href="{url}" style="color:#1da1f2;">{author}</a> — {summary}'
+            f'</li>'
         )
-        page = context.pages[0] if context.pages else await context.new_page()
-
-        for url in urls:
-            try:
-                log.info(f"Opening for like: {url}")
-                await page.goto(url, wait_until="domcontentloaded")
-
-                # Wait for an active (not-yet-liked) like button
-                try:
-                    await page.wait_for_selector(
-                        'button[data-testid="like"]', timeout=10000
-                    )
-                except Exception:
-                    log.info(f"  No like button (already liked or unavailable): {url}")
-                    continue
-
-                # Dwell as if reading
-                await asyncio.sleep(random.uniform(3.0, 7.0))
-
-                await page.click('button[data-testid="like"]')
-                log.info(f"  Liked: {url}")
-
-                # Dwell before next
-                await asyncio.sleep(random.uniform(4.0, 9.0))
-            except Exception as e:
-                log.warning(f"  Like failed for {url}: {e}")
-                continue
-
-        await context.close()
+    lines.append("</ol>")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Email
 # ---------------------------------------------------------------------------
 
-def build_email_html(summary_html: str, stats: dict) -> str:
+def build_email_html(summary_html: str, suggest_html: str, stats: dict) -> str:
     today = datetime.now()
     return f"""\
 <!DOCTYPE html>
@@ -716,6 +701,8 @@ def build_email_html(summary_html: str, stats: dict) -> str:
   </p>
 
   {summary_html}
+
+  {suggest_html}
 
   <hr style="margin-top: 30px; border: none; border-top: 1px solid #eee;">
   <p style="color: #aaa; font-size: 11px;">
@@ -755,7 +742,6 @@ async def main():
     login_linkedin = "--login-linkedin" in sys.argv
     x_only = "--x-only" in sys.argv
     linkedin_only = "--linkedin-only" in sys.argv
-    no_like = "--no-like" in sys.argv
     dry_run = "--dry-run" in sys.argv
 
     log.info("=== Daily Digest ===")
@@ -794,15 +780,17 @@ async def main():
 
     # Render + build email
     summary_html = render_digest_html(items)
+    suggest_count = config.get("settings", {}).get("suggest_like_count", 3)
+    suggest_html = render_suggested_likes_html(items, suggest_count)
     stats = {
         "item_count": len(items),
         "tweet_count": len(tweets),
         "post_count": len(linkedin_posts),
     }
-    full_html = build_email_html(summary_html, stats)
+    full_html = build_email_html(summary_html, suggest_html, stats)
 
     if dry_run:
-        log.info("--dry-run: printing HTML instead of sending / liking / saving state")
+        log.info("--dry-run: printing HTML instead of sending / saving state")
         print(full_html)
         return
 
@@ -820,16 +808,6 @@ async def main():
         })
     save_state(state)
     log.info(f"Saved {len(items)} new items to state")
-
-    # Auto-like top X tweets
-    if not no_like:
-        like_count = config.get("settings", {}).get("auto_like_count", 3)
-        x_urls = [i["url"] for i in items if i.get("platform") == "x"][:like_count]
-        if x_urls:
-            log.info(f"Liking top {len(x_urls)} X tweets")
-            await like_top_tweets(x_urls, config)
-        else:
-            log.info("No X items to like")
 
     log.info("Done!")
 

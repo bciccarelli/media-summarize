@@ -13,7 +13,6 @@ email:
 # Settings
 settings:
   target_tweets: 60           # How many tweets to collect from your X feed
-  target_linkedin_posts: 25   # Fewer than tweets — LinkedIn is stricter about bots
   max_digest_items: 8         # Hard cap on items in the final email
   min_signal_score: 7         # Items below this 1-10 score are filtered out
   suggest_like_count: 3       # Top-N X items to suggest liking manually

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily X + LinkedIn digest: scroll feeds, rank with Gemini, email top items, auto-like on X."""
+"""Daily X digest: scroll feed, rank with Gemini, email top items."""
 
 import asyncio
 import json
@@ -24,7 +24,6 @@ from playwright.async_api import async_playwright
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 BROWSER_DIR = BASE_DIR / "browser_data"
-LINKEDIN_BROWSER_DIR = BASE_DIR / "browser_data_linkedin"
 STATE_PATH = BASE_DIR / "digest_state.json"
 
 logging.basicConfig(
@@ -181,210 +180,6 @@ async def fetch_tweets_browser(config: dict, login_mode: bool = False) -> list[d
 
 
 # ---------------------------------------------------------------------------
-# LinkedIn fetching via browser
-# ---------------------------------------------------------------------------
-
-async def extract_linkedin_posts_from_page(page) -> list[dict]:
-    """Extract post data from currently visible LinkedIn feed items."""
-    return await page.evaluate("""
-        () => {
-            const posts = [];
-            const feed = document.querySelector('[data-testid="mainFeed"]');
-            if (!feed) return posts;
-
-            const children = feed.querySelectorAll(':scope > div[data-display-contents]');
-            for (const post of children) {
-                try {
-                    // Post text — from expandable-text-box (first one is the main text)
-                    const textEl = post.querySelector('span[data-testid="expandable-text-box"]');
-                    const text = textEl ? textEl.innerText.trim() : '';
-
-                    // Author name — extract from control menu button aria-label
-                    // e.g. "Open control menu for post by Kyle Macdonald"
-                    let name = '';
-                    const menuBtn = post.querySelector('button[aria-label^="Open control menu for post by"]');
-                    if (menuBtn) {
-                        const label = menuBtn.getAttribute('aria-label');
-                        name = label.replace('Open control menu for post by ', '');
-                    }
-
-                    // Author title — from the profile link text which contains name + degree + title
-                    // e.g. "Kyle Macdonald\\n\\n \\n • 1st\\n\\nInvestor | Sil"
-                    let title = '';
-                    const profileLinks = post.querySelectorAll('a[href*="/in/"]');
-                    for (const link of profileLinks) {
-                        const linkText = link.innerText.trim();
-                        // Find the link that has the author name and title info (multiline)
-                        if (linkText.includes('\\n') && linkText.includes(name.split(' ')[0])) {
-                            const parts = linkText.split('\\n').map(s => s.trim()).filter(Boolean);
-                            // Title is usually after the connection degree marker
-                            const degreeIdx = parts.findIndex(p => p.match(/^•\\s*(1st|2nd|3rd)/));
-                            if (degreeIdx >= 0 && degreeIdx + 1 < parts.length) {
-                                title = parts.slice(degreeIdx + 1).join(' ');
-                            } else if (parts.length > 1) {
-                                title = parts[parts.length - 1];
-                            }
-                            break;
-                        }
-                    }
-
-                    // Profile URL
-                    let profileUrl = '';
-                    const firstProfileLink = post.querySelector('a[href*="/in/"]');
-                    if (firstProfileLink) {
-                        profileUrl = firstProfileLink.getAttribute('href').split('?')[0];
-                    }
-
-                    // Reactions count — look for link text matching "N reactions"
-                    let reactions = 0;
-                    const allLinks = post.querySelectorAll('a');
-                    for (const link of allLinks) {
-                        const lt = link.innerText.trim();
-                        const m = lt.match(/^(\\d[\\d,]*)\\s*reactions?/i);
-                        if (m) {
-                            reactions = parseInt(m[1].replace(/,/g, ''));
-                            break;
-                        }
-                    }
-
-                    // Comments count — from Comment button or nearby text
-                    let comments = 0;
-                    const allBtns = post.querySelectorAll('button');
-                    for (const btn of allBtns) {
-                        const lt = (btn.getAttribute('aria-label') || btn.innerText || '').trim();
-                        const m = lt.match(/(\\d+)\\s*comment/i);
-                        if (m) {
-                            comments = parseInt(m[1]);
-                            break;
-                        }
-                    }
-
-                    // Dedup key — use profile URL + first 60 chars of text
-                    const dedupKey = (profileUrl || name) + ':' + text.slice(0, 60);
-
-                    if (text || name) {
-                        posts.push({
-                            text, name, title, profileUrl,
-                            url: '',  // LinkedIn doesn't expose post permalink in feed DOM
-                            reactions, comments, postType: 'post',
-                            dedupKey
-                        });
-                    }
-                } catch (e) {
-                    // Skip malformed post
-                }
-            }
-            return posts;
-        }
-    """)
-
-
-async def linkedin_natural_scroll(page):
-    """Scroll LinkedIn feed — slower and more cautious than X."""
-    scroll_px = random.randint(600, 1000)
-
-    # LinkedIn sets body overflow:hidden and scrolls inside <main id="workspace">
-    await page.evaluate(f"""
-        (() => {{
-            const el = document.getElementById('workspace') || document.querySelector('main');
-            if (el) el.scrollBy(0, {scroll_px});
-            else window.scrollBy(0, {scroll_px});
-        }})()
-    """)
-
-    # Longer pauses than X, with more frequent "reading" stops
-    r = random.random()
-    if r < 0.25:
-        delay = random.uniform(5.0, 10.0)   # reading a long post
-    elif r < 0.40:
-        delay = random.uniform(3.0, 5.0)    # skimming
-    else:
-        delay = random.uniform(2.0, 4.0)    # normal scroll
-
-    await asyncio.sleep(delay)
-
-    # Occasional mouse movement to look natural
-    if random.random() < 0.10:
-        x = random.randint(200, 800)
-        y = random.randint(200, 600)
-        await page.mouse.move(x, y)
-        await asyncio.sleep(random.uniform(0.3, 0.8))
-
-
-async def fetch_linkedin_posts_browser(config: dict, login_mode: bool = False) -> list[dict]:
-    """Open LinkedIn in a browser, scroll the feed, and extract posts."""
-    target = config.get("settings", {}).get("target_linkedin_posts", 40)
-    headless = not login_mode
-
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(LINKEDIN_BROWSER_DIR),
-            headless=headless,
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-        )
-        page = context.pages[0] if context.pages else await context.new_page()
-
-        log.info("Navigating to LinkedIn feed")
-        await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
-
-        if login_mode:
-            log.info("LOGIN MODE: Please log in to LinkedIn in the browser window.")
-            log.info("After seeing your feed, press Enter here.")
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input("\n>>> Press Enter after LinkedIn login... ")
-            )
-            await context.close()
-            log.info("LinkedIn login saved. Run again without --login-linkedin.")
-            return []
-
-        # Wait for feed to load
-        try:
-            await page.wait_for_selector(
-                '[data-testid="mainFeed"]', timeout=20000
-            )
-        except Exception:
-            log.error("LinkedIn feed did not load — run with --login-linkedin first")
-            await context.close()
-            return []
-
-        # Let the page settle before scrolling
-        await asyncio.sleep(random.uniform(2.0, 4.0))
-
-        log.info(f"LinkedIn feed loaded — scrolling to collect ~{target} posts")
-
-        all_posts: dict[str, dict] = {}  # keyed by dedupKey
-        stale_rounds = 0
-
-        while len(all_posts) < target and stale_rounds < 8:
-            before = len(all_posts)
-            batch = await extract_linkedin_posts_from_page(page)
-            for post in batch:
-                key = post.get("dedupKey") or post.get("text", "")[:80]
-                if key and key not in all_posts:
-                    all_posts[key] = post
-
-            new = len(all_posts) - before
-            if new == 0:
-                stale_rounds += 1
-            else:
-                stale_rounds = 0
-
-            log.info(f"  [LinkedIn] Collected {len(all_posts)}/{target} posts (+{new} new)")
-
-            # Scroll, then wait for new content to load
-            await linkedin_natural_scroll(page)
-            # Give LinkedIn time to lazy-load new posts after scroll
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-
-        await context.close()
-
-    posts = list(all_posts.values())
-    log.info(f"Total LinkedIn posts collected: {len(posts)}")
-    return posts
-
-
-# ---------------------------------------------------------------------------
 # State (cross-day dedup)
 # ---------------------------------------------------------------------------
 
@@ -417,16 +212,15 @@ def save_state(state: dict):
 
 
 def filter_by_sent_urls(tweets: list[dict], state: dict) -> list[dict]:
-    """Drop X tweets already surfaced in a recent digest. LinkedIn dedup is
-    handled via the RECENTLY COVERED prompt section instead (no stable URL)."""
+    """Drop tweets already surfaced in a recent digest."""
     sent_urls = {
         item["url"] for item in state.get("sent_items", [])
-        if item.get("platform") == "x" and item.get("url")
+        if item.get("url")
     }
     filtered = [t for t in tweets if t.get("url") not in sent_urls]
     dropped = len(tweets) - len(filtered)
     if dropped:
-        log.info(f"Dedup dropped {dropped} X tweets seen in last window")
+        log.info(f"Dedup dropped {dropped} tweets seen in last window")
     return filtered
 
 
@@ -435,14 +229,14 @@ def filter_by_sent_urls(tweets: list[dict], state: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 DIGEST_PROMPT = """\
-You are curating a daily signal-only digest for an AI engineer / data scientist
-who works at startups. Their X + LinkedIn feeds are noisy — only surface items
-they should actually act on or know about today.
+You are curating a daily signal-only digest of X/Twitter posts for an AI
+engineer / data scientist who works at startups. Their feed is noisy — only
+surface items they should actually act on or know about today.
 
 TODAY'S DATE: {today}
 
 RULES:
-- Return AT MOST {max_items} items total across both platforms.
+- Return AT MOST {max_items} items.
 - Only include items scoring {min_score}+ on a 1-10 signal scale. If nothing
   meets the bar, return FEWER items — even zero is acceptable.
 - signal_score meaning: 10 = definitely act on this today; 7 = worth their 30
@@ -451,10 +245,8 @@ RULES:
 WHAT COUNTS AS SIGNAL:
 - Research / papers with concrete results (not "we should think about X")
 - Tool releases with a clear use-case they could try this week
-- Startup hiring DS/ML/AI roles (especially from their LinkedIn network)
 - Events / conferences with an RSVP window that hasn't expired
 - Funding announcements (implies hiring is about to open)
-- Close-connection job moves on LinkedIn (1st-degree moves to new roles)
 - Concrete industry shifts (regulation, named model release, acquisition)
 
 WHAT COUNTS AS JUNK (skip):
@@ -468,22 +260,18 @@ RECENTLY COVERED (do NOT re-surface these topics):
 {recently_covered}
 
 CATEGORIES (use exactly one per item):
-Research | Tools | Opportunity | Event | Network Move | Signal
+Research | Tools | Opportunity | Event | Signal
 
 For each item, return:
-- platform: "x" or "linkedin"
-- url: the exact url from the input data (tweet URL for X, profile URL for LinkedIn)
-- author: @handle for X, "Name — Title" for LinkedIn
-- category: one of the six above
+- url: the exact tweet URL from the input data
+- author: @handle
+- category: one of the five above
 - summary: ONE sentence, <=25 words, what they need to know / do
 - signal_score: integer 1-10
-- reason: short phrase (e.g. "concrete benchmark", "1st-degree move", "RSVP Friday")
+- reason: short phrase (e.g. "concrete benchmark", "RSVP Friday")
 
 X POSTS:
 {x_data}
-
-LINKEDIN POSTS:
-{linkedin_data}
 """
 
 
@@ -495,7 +283,6 @@ DIGEST_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "platform": {"type": "string", "enum": ["x", "linkedin"]},
                     "url": {"type": "string"},
                     "author": {"type": "string"},
                     "category": {"type": "string"},
@@ -504,7 +291,7 @@ DIGEST_SCHEMA = {
                     "reason": {"type": "string"},
                 },
                 "required": [
-                    "platform", "url", "author", "category",
+                    "url", "author", "category",
                     "summary", "signal_score", "reason",
                 ],
             },
@@ -524,20 +311,6 @@ def format_x_for_prompt(tweets: list[dict]) -> str:
     )
 
 
-def format_linkedin_for_prompt(posts: list[dict]) -> str:
-    if not posts:
-        return "(none)"
-    lines = []
-    for p in posts:
-        url = p.get("profileUrl") or ""
-        lines.append(
-            f"{p.get('name', 'Unknown')} — {p.get('title', '')}: {p['text']} | "
-            f"{url} | {p.get('reactions', 0)} reactions | "
-            f"{p.get('comments', 0)} comments"
-        )
-    return "\n".join(lines)
-
-
 def format_recently_covered(state: dict) -> str:
     items = state.get("sent_items", [])
     if not items:
@@ -549,8 +322,7 @@ def format_recently_covered(state: dict) -> str:
     )
 
 
-def summarize_combined(tweets: list[dict], posts: list[dict],
-                       state: dict, config: dict) -> list[dict]:
+def summarize_combined(tweets: list[dict], state: dict, config: dict) -> list[dict]:
     """Single Gemini call — returns a ranked list of digest items (JSON)."""
     settings = config.get("settings", {})
     max_items = settings.get("max_digest_items", 8)
@@ -562,7 +334,6 @@ def summarize_combined(tweets: list[dict], posts: list[dict],
         min_score=min_score,
         recently_covered=format_recently_covered(state),
         x_data=format_x_for_prompt(tweets),
-        linkedin_data=format_linkedin_for_prompt(posts),
     )
 
     gem = config["gemini"]
@@ -598,7 +369,7 @@ def summarize_combined(tweets: list[dict], posts: list[dict],
 # Render digest → HTML
 # ---------------------------------------------------------------------------
 
-CATEGORY_ORDER = ["Research", "Tools", "Opportunity", "Event", "Network Move", "Signal"]
+CATEGORY_ORDER = ["Research", "Tools", "Opportunity", "Event", "Signal"]
 
 
 def render_digest_html(items: list[dict]) -> str:
@@ -634,12 +405,11 @@ def render_digest_html(items: list[dict]) -> str:
                 f'<a href="{url}" style="color:#1da1f2;">link</a>'
                 if url else ""
             )
-            platform_badge = "X" if item.get("platform") == "x" else "LI"
             parts.append(
                 f'<li style="margin-bottom:10px;">'
                 f'<strong>{summary}</strong><br>'
                 f'<span style="color:#888;font-size:13px;">'
-                f'{platform_badge} · {author} · {reason} · '
+                f'{author} · {reason} · '
                 f'score {score}{" · " + link_html if link_html else ""}'
                 f'</span></li>'
             )
@@ -652,10 +422,10 @@ def render_digest_html(items: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def render_suggested_likes_html(items: list[dict], count: int) -> str:
-    """Pick the top N X items by signal score and render a quick-action section."""
-    x_items = [i for i in items if i.get("platform") == "x" and i.get("url")]
-    x_items.sort(key=lambda i: i.get("signal_score", 0), reverse=True)
-    picks = x_items[:count]
+    """Pick the top N items by signal score and render a quick-action section."""
+    ranked = [i for i in items if i.get("url")]
+    ranked.sort(key=lambda i: i.get("signal_score", 0), reverse=True)
+    picks = ranked[:count]
     if not picks:
         return ""
 
@@ -697,7 +467,7 @@ def build_email_html(summary_html: str, suggest_html: str, stats: dict) -> str:
     Daily Digest &mdash; {today.strftime('%A, %b %d, %Y')}
   </h1>
   <p style="color: #888; font-size: 13px; margin-top: 0;">
-    {stats['item_count']} items surfaced from {stats['tweet_count']} tweets + {stats['post_count']} LinkedIn posts
+    {stats['item_count']} items surfaced from {stats['tweet_count']} tweets
   </p>
 
   {summary_html}
@@ -739,9 +509,6 @@ def send_email(html: str, config: dict):
 
 async def main():
     login_x = "--login" in sys.argv
-    login_linkedin = "--login-linkedin" in sys.argv
-    x_only = "--x-only" in sys.argv
-    linkedin_only = "--linkedin-only" in sys.argv
     dry_run = "--dry-run" in sys.argv
 
     log.info("=== Daily Digest ===")
@@ -750,42 +517,27 @@ async def main():
     if login_x:
         await fetch_tweets_browser(config, login_mode=True)
         return
-    if login_linkedin:
-        await fetch_linkedin_posts_browser(config, login_mode=True)
-        return
 
     state = load_state(config)
     log.info(f"State: {len(state.get('sent_items', []))} recent items in memory")
 
-    tweets = []
-    if not linkedin_only:
-        tweets = await fetch_tweets_browser(config)
-        log.info(f"Fetched {len(tweets)} tweets from "
-                 f"{len(set(t.get('handle', '') for t in tweets))} accounts")
+    tweets = await fetch_tweets_browser(config)
+    log.info(f"Fetched {len(tweets)} tweets from "
+             f"{len(set(t.get('handle', '') for t in tweets))} accounts")
 
-    linkedin_posts = []
-    if not x_only:
-        linkedin_posts = await fetch_linkedin_posts_browser(config)
-        log.info(f"Fetched {len(linkedin_posts)} LinkedIn posts from "
-                 f"{len(set(p.get('name', '') for p in linkedin_posts))} people")
+    if not tweets:
+        log.warning("No tweets collected")
 
-    if not tweets and not linkedin_posts:
-        log.warning("No content collected from any source")
-
-    # Pre-Gemini URL filter (X only; LinkedIn dedup happens in-prompt)
     tweets = filter_by_sent_urls(tweets, state)
 
-    # Single Gemini call → ranked items
-    items = summarize_combined(tweets, linkedin_posts, state, config)
+    items = summarize_combined(tweets, state, config)
 
-    # Render + build email
     summary_html = render_digest_html(items)
     suggest_count = config.get("settings", {}).get("suggest_like_count", 3)
     suggest_html = render_suggested_likes_html(items, suggest_count)
     stats = {
         "item_count": len(items),
         "tweet_count": len(tweets),
-        "post_count": len(linkedin_posts),
     }
     full_html = build_email_html(summary_html, suggest_html, stats)
 
@@ -796,12 +548,10 @@ async def main():
 
     send_email(full_html, config)
 
-    # Persist today's items to state
     today_str = datetime.now().strftime("%Y-%m-%d")
     for item in items:
         state["sent_items"].append({
             "url": item.get("url", ""),
-            "platform": item.get("platform"),
             "summary": item.get("summary"),
             "category": item.get("category"),
             "sent_on": today_str,

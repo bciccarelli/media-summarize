@@ -229,46 +229,106 @@ def filter_by_sent_urls(tweets: list[dict], state: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 DIGEST_PROMPT = """\
-You are curating a daily signal-only digest of X/Twitter posts for an AI
-engineer / data scientist who works at startups. Their feed is noisy — only
-surface items they should actually act on or know about today.
+You are curating a daily digest for an AI Solutions Architect. They build
+production interfaces and data pipelines that solve real end-user problems
+with AI. Their bar for what's worth reading is EXTREMELY high.
+
+EVERY item must be directly relevant to their work — building AI-powered
+interfaces, data pipelines, and end-user solutions. If you can't articulate
+how it changes the way they design or ship AI products, skip it. Cool but
+unrelated items (robotics, biotech, hardware, gaming, crypto, general tech
+news) DO NOT BELONG in this digest no matter how impressive they are.
+
+ONLY surface items that could change their daily workflow. Skip everything
+else, even if it's interesting. An empty digest is the right answer most days.
 
 TODAY'S DATE: {today}
 
+THE BAR — only include items in these categories:
+
+1. FRONTIER MODEL RELEASE — a major lab (Anthropic, OpenAI, Google DeepMind,
+   Meta, xAI, Mistral, DeepSeek, Qwen) ships a new flagship model or a
+   meaningful capability upgrade. Examples: "Claude 4.7 launches", "GPT-5
+   ships with native video", "Gemini 3 Pro tops the leaderboards".
+
+2. MAJOR PRODUCT ANNOUNCEMENT that could replace a tool in their stack.
+   Examples: "Claude Design launches (Figma replacement powered by AI)",
+   "Cursor 2.0 with multi-agent", "Vercel ships v0 enterprise", "Anthropic
+   launches Computer Use API GA", "OpenAI launches Agent Builder", "Replit
+   acquires X for agent infra".
+
+3. NEW API / CAPABILITY from a major AI provider that meaningfully changes
+   how to build with AI. Examples: prompt caching launches, structured
+   output goes GA, native multi-modal endpoints, new reasoning modes,
+   pricing cuts that change architecture decisions.
+
+4. INFRASTRUCTURE / DEVTOOL that an AI builder would actually use:
+   vector DBs, eval frameworks, agent platforms, RAG tooling — but ONLY
+   when it's a substantive launch from a known player, not a YC demo.
+
+5. SOTA / FRONTIER RESEARCH that meaningfully shifts what's possible.
+   Examples: a new architecture beating transformers on real tasks, a
+   capability jump (e.g. "1M-context with no quality loss"), a paper
+   from a top lab (Anthropic, DeepMind, OpenAI, FAIR, Stanford, MIT)
+   showing a result that changes how systems get built. Skip incremental
+   benchmark wins, niche results, or papers nobody is talking about.
+
+6. HARDWARE / PRICING news that could change the economics of their
+   projects. Examples: a new NVIDIA chip with major perf-per-dollar
+   improvement, GPU availability shifts, inference cost cuts from a
+   provider, a new accelerator launch (Cerebras, Groq, AWS Trainium)
+   that changes deploy decisions. ONLY include when the cost or
+   availability impact is concrete and quantified.
+
+7. LESSONS FROM THE FIELD — AT MOST ONE PER DAY. A specific,
+   battle-tested insight from a credible AI practitioner (CTO, staff
+   engineer, or founder at a known AI company actually shipping
+   production systems) about building real AI products. Must contain
+   a concrete, actionable lesson — not vague advice. Example: "After
+   shipping RAG to 10M users, we learned that re-ranking matters more
+   than embeddings for our use case, here's the eval data". Skip
+   anything from anonymous accounts, generic "founder mode" content,
+   or thought-leadership without specifics.
+
+EXPLICITLY SKIP (do NOT include, even if highly upvoted):
+- Incremental research / benchmark wins on niche tasks
+- Hot takes, predictions, "the future of X" threads
+- Founder advice, hiring tips, career thoughts
+- Funding announcements (unless paired with a product launch)
+- "Just shipped a side project" posts unless it's a known team
+- Event announcements, conferences, webinars
+- Tutorials, "how I built X" threads
+- Memes, screenshots, casual banter
+- Anything semantically covered in RECENTLY COVERED below
+
 RULES:
-- Return AT MOST {max_items} items.
-- Only include items scoring {min_score}+ on a 1-10 signal scale. If nothing
-  meets the bar, return FEWER items — even zero is acceptable.
-- signal_score meaning: 10 = definitely act on this today; 7 = worth their 30
-  seconds; 5 = interesting but skippable; <5 = don't include.
-
-WHAT COUNTS AS SIGNAL:
-- Research / papers with concrete results (not "we should think about X")
-- Tool releases with a clear use-case they could try this week
-- Events / conferences with an RSVP window that hasn't expired
-- Funding announcements (implies hiring is about to open)
-- Concrete industry shifts (regulation, named model release, acquisition)
-
-WHAT COUNTS AS JUNK (skip):
-- Motivational posts, "just shipped!" without a link, engagement-bait polls
-- Reshares without commentary
-- Generic AI-hype threads or unsubstantiated hot takes
-- Events whose date has already passed (check TODAY'S DATE)
-- Anything semantically covered in RECENTLY COVERED — even if the URL differs
+- Return AT MOST {max_items} items. Most days return 0-2.
+- Only include items scoring {min_score}+ on this scale:
+  - 10 = a tool they will install/integrate this week
+  - 9 = changes their architecture decisions
+  - 8 = they need to know this exists; bar to include
+  - <8 = don't include
+- If nothing meets the bar, return an empty list. That is correct.
+- Prefer the original announcement over commentary about it. If multiple
+  posts cover the same launch, pick the most authoritative source.
 
 RECENTLY COVERED (do NOT re-surface these topics):
 {recently_covered}
 
-CATEGORIES (use exactly one per item):
-Research | Tools | Opportunity | Event | Signal
+CATEGORIES (use exactly one):
+Model Release | Product Launch | API / Capability | Infrastructure | Frontier Research | Hardware / Pricing | Field Lesson
 
-For each item, return:
-- url: the exact tweet URL from the input data
-- author: @handle
-- category: one of the five above
-- summary: ONE sentence, <=25 words, what they need to know / do
-- signal_score: integer 1-10
-- reason: short phrase (e.g. "concrete benchmark", "RSVP Friday")
+Constraint: AT MOST ONE "Field Lesson" item per digest, ever. If you have
+two strong field lessons, pick the better one and drop the other.
+
+For each item:
+- url: exact tweet URL from input
+- author: @handle (prefer the official company/launcher account)
+- category: one of the four above
+- summary: ONE sentence, <=25 words, naming the product and what it does
+- signal_score: integer 8-10
+- reason: short phrase explaining workflow impact (e.g. "replaces Figma",
+  "ships native video", "cuts inference cost 5x")
 
 X POSTS:
 {x_data}
@@ -359,7 +419,17 @@ def summarize_combined(tweets: list[dict], state: dict, config: dict) -> list[di
 
     items = [i for i in items if i.get("signal_score", 0) >= min_score]
     items.sort(key=lambda i: i.get("signal_score", 0), reverse=True)
-    items = items[:max_items]
+
+    # Hard cap: at most 1 Field Lesson per digest
+    capped: list[dict] = []
+    field_lessons_kept = 0
+    for item in items:
+        if item.get("category") == "Field Lesson":
+            if field_lessons_kept >= 1:
+                continue
+            field_lessons_kept += 1
+        capped.append(item)
+    items = capped[:max_items]
 
     log.info(f"Gemini surfaced {len(items)} items meeting signal floor")
     return items
@@ -369,7 +439,10 @@ def summarize_combined(tweets: list[dict], state: dict, config: dict) -> list[di
 # Render digest → HTML
 # ---------------------------------------------------------------------------
 
-CATEGORY_ORDER = ["Research", "Tools", "Opportunity", "Event", "Signal"]
+CATEGORY_ORDER = [
+    "Model Release", "Product Launch", "API / Capability",
+    "Infrastructure", "Frontier Research", "Hardware / Pricing", "Field Lesson",
+]
 
 
 def render_digest_html(items: list[dict]) -> str:
@@ -531,6 +604,10 @@ async def main():
     tweets = filter_by_sent_urls(tweets, state)
 
     items = summarize_combined(tweets, state, config)
+
+    if not items:
+        log.info("No items met the signal bar — skipping email")
+        return
 
     summary_html = render_digest_html(items)
     suggest_count = config.get("settings", {}).get("suggest_like_count", 3)
